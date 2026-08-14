@@ -1,7 +1,7 @@
 {
   "name": "dsh-drop-file-to-path",
-  "version": "1.0.0",
-  "description": "Codex-style drag-drop for DSH web GUI: drag any file, it lands in ~/.dsh-dropbox, the absolute path text is inserted into the composer input. Hot-pluggable: install with `dsh plugin --profile web add ./plugins/drop-file-to-path`, no dsh source changes.",
+  "version": "1.1.0",
+  "description": "Codex-style drag-drop for DSH web GUI: drag any file, it lands in ~/.dsh-dropbox, and the path lands in the composer as a whole blue chip (the mandatory .b64 suffix is display-hidden; the real path serializes on submit). Hot-pluggable: install with `dsh plugin --profile web add ./plugins/drop-file-to-path`, no dsh source changes.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
