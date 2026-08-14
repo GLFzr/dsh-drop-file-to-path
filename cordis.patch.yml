@@ -1,0 +1,8 @@
+# dsh-drop-file-to-path bundle patch: inserts the dual-face plugin row into
+# the web profile roster. The node half (exports ".") runs in the host process
+# (HTTP upload routes under /api/drop-file-to-path/*), and the `dsh.client`
+# declaration in package.json makes the browser half (exports "./client")
+# load in the web GUI.
+- insert:
+    - id: drop-file-to-path
+      name: 'dsh-drop-file-to-path'
