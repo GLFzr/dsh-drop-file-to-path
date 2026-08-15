@@ -1,4 +1,4 @@
-// Host-half behavior tests for dsh-drop-file-to-path. Runs standalone with
+// Host-half behavior tests for dsh-file-upload. Runs standalone with
 // `node --test tests/host.test.mjs` (no DSH server required): the plugin's
 // apply() is driven with a fake webServer/timer ctx and a temp dropbox dir.
 import { test } from 'node:test'
@@ -52,7 +52,7 @@ function chunksOf(buf) {
 }
 
 async function upload(h, name, buf) {
-  const begin = await h.call('/api/drop-file-to-path/begin', { name, size: buf.length })
+  const begin = await h.call('/api/file-upload/begin', { name, size: buf.length })
   assert.equal(begin.code, 200, 'begin ok')
   // begin fast-path: same name+size already in the dropbox → path returned,
   // no token, nothing uploaded.
@@ -61,10 +61,10 @@ async function upload(h, name, buf) {
   assert.ok(token, 'token issued')
   const parts = chunksOf(buf)
   for (let i = 0; i < parts.length; i++) {
-    const r = await h.call('/api/drop-file-to-path/chunk', { token, index: i, data: b64(parts[i]) })
+    const r = await h.call('/api/file-upload/chunk', { token, index: i, data: b64(parts[i]) })
     assert.equal(r.code, 200, 'chunk ' + i + ' ok')
   }
-  return h.call('/api/drop-file-to-path/end', { token })
+  return h.call('/api/file-upload/end', { token })
 }
 
 function withDropbox(t, config) {
@@ -145,16 +145,16 @@ test('multi-chunk binary round-trips (b64 text decodes to exact original)', asyn
 
 test('truncated chunk data is rejected at receipt', async (t) => {
   const { h } = withDropbox(t)
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'x.bin', size: 100 })
-  const r = await h.call('/api/drop-file-to-path/chunk', { token: begin.body.token, index: 0, data: 'QUJD' })
+  const begin = await h.call('/api/file-upload/begin', { name: 'x.bin', size: 100 })
+  const r = await h.call('/api/file-upload/chunk', { token: begin.body.token, index: 0, data: 'QUJD' })
   assert.equal(r.code, 400)
   assert.match(r.body.error, /长度不符/)
 })
 
 test('chunk beyond the declared file is rejected', async (t) => {
   const { h } = withDropbox(t)
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'x.bin', size: 10 })
-  const r = await h.call('/api/drop-file-to-path/chunk', { token: begin.body.token, index: 7, data: 'QUJDRA==' })
+  const begin = await h.call('/api/file-upload/begin', { name: 'x.bin', size: 10 })
+  const r = await h.call('/api/file-upload/chunk', { token: begin.body.token, index: 7, data: 'QUJDRA==' })
   assert.equal(r.code, 400)
   assert.match(r.body.error, /越界/)
 })
@@ -162,24 +162,24 @@ test('chunk beyond the declared file is rejected', async (t) => {
 test('end rejects missing chunk indices and short totals', async (t) => {
   const { h } = withDropbox(t)
   const size = CHUNK + 100
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'x.bin', size })
+  const begin = await h.call('/api/file-upload/begin', { name: 'x.bin', size })
   const token = begin.body.token
   // Chunk 1 arrives, chunk 0 never does.
-  await h.call('/api/drop-file-to-path/chunk', { token, index: 1, data: b64(Buffer.alloc(100, 1)) })
-  const end = await h.call('/api/drop-file-to-path/end', { token })
+  await h.call('/api/file-upload/chunk', { token, index: 1, data: b64(Buffer.alloc(100, 1)) })
+  const end = await h.call('/api/file-upload/end', { token })
   assert.equal(end.code, 400)
   assert.match(end.body.error, /缺失|不完整/)
 })
 
 test('end rejects a payload that decodes to the wrong size', async (t) => {
   const { h } = withDropbox(t)
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'x.txt', size: 100 })
+  const begin = await h.call('/api/file-upload/begin', { name: 'x.txt', size: 100 })
   const token = begin.body.token
   // Correct chunk length (136 chars) but content decodes to 102 bytes: the
   // decoded size cannot match the declared 100.
-  const chunk = await h.call('/api/drop-file-to-path/chunk', { token, index: 0, data: 'A'.repeat(136) })
+  const chunk = await h.call('/api/file-upload/chunk', { token, index: 0, data: 'A'.repeat(136) })
   assert.equal(chunk.code, 200, 'length-valid chunk accepted')
-  const end = await h.call('/api/drop-file-to-path/end', { token })
+  const end = await h.call('/api/file-upload/end', { token })
   assert.equal(end.code, 400)
   assert.match(end.body.error, /字节数与声明不符/)
 })
@@ -219,7 +219,7 @@ test('dedupe: identical binary content reuses the .b64 path (via begin fast-path
 
 test('non-loopback callers are accepted (no remote-address gate; the server binds loopback anyway)', async (t) => {
   const { h } = withDropbox(t)
-  const ok = await h.call('/api/drop-file-to-path/begin', { name: 'a.txt', size: 1 }, '192.168.1.50')
+  const ok = await h.call('/api/file-upload/begin', { name: 'a.txt', size: 1 }, '192.168.1.50')
   assert.equal(ok.code, 200)
 })
 
@@ -228,7 +228,7 @@ test('begin fast-path: same name+size reuses instantly without any upload', asyn
   const content = Buffer.from('fast dedupe', 'utf8')
   const first = await upload(h, 'fast.txt', content)
   assert.equal(first.code, 200)
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'fast.txt', size: content.length })
+  const begin = await h.call('/api/file-upload/begin', { name: 'fast.txt', size: content.length })
   assert.equal(begin.code, 200)
   assert.equal(begin.body.path, first.body.path)
   assert.equal(begin.body.encoded, false)
@@ -240,7 +240,7 @@ test('begin fast-path hits .b64 files too', async (t) => {
   const content = Buffer.from([1, 2, 3, 4, 5])
   const first = await upload(h, 'f.bin', content)
   assert.equal(first.code, 200)
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'f.bin', size: content.length })
+  const begin = await h.call('/api/file-upload/begin', { name: 'f.bin', size: content.length })
   assert.equal(begin.body.path, first.body.path)
   assert.equal(begin.body.encoded, true)
   assert.deepEqual(readdirSync(dir), ['f.bin.b64'])
@@ -254,7 +254,7 @@ test('list + clean: inventory marks _N copies, cleanup modes work', async (t) =>
   await upload(h, 'b.bin', Buffer.from([1, 2, 3]))
   await upload(h, 'b.bin', Buffer.from([4, 5, 6, 7]))
 
-  const list = await h.call('/api/drop-file-to-path/list', {})
+  const list = await h.call('/api/file-upload/list', {})
   assert.equal(list.code, 200)
   const names = new Set(list.body.files.map((f) => f.name))
   assert.deepEqual([...names].sort(), ['a.txt', 'a_1.txt', 'b.bin.b64', 'b.bin_1.b64'].sort())
@@ -266,18 +266,18 @@ test('list + clean: inventory marks _N copies, cleanup modes work', async (t) =>
   assert.ok(list.body.totalBytes > 0)
 
   // duplicates mode removes only the _N copies
-  const dup = await h.call('/api/drop-file-to-path/clean', { mode: 'duplicates' })
+  const dup = await h.call('/api/file-upload/clean', { mode: 'duplicates' })
   assert.equal(dup.code, 200)
   assert.deepEqual(dup.body.deleted.sort(), ['a_1.txt', 'b.bin_1.b64'])
   assert.deepEqual(readdirSync(dir).sort(), ['a.txt', 'b.bin.b64'])
 
   // largerThan mode with a tiny threshold removes everything left
-  const big = await h.call('/api/drop-file-to-path/clean', { mode: 'largerThan', minSizeBytes: 1 })
+  const big = await h.call('/api/file-upload/clean', { mode: 'largerThan', minSizeBytes: 1 })
   assert.equal(big.code, 200)
   assert.deepEqual(readdirSync(dir), [])
 
   // all mode on an empty dropbox is a no-op
-  const all = await h.call('/api/drop-file-to-path/clean', { mode: 'all' })
+  const all = await h.call('/api/file-upload/clean', { mode: 'all' })
   assert.equal(all.code, 200)
   assert.deepEqual(all.body.deleted, [])
   assert.equal(all.body.freedBytes, 0)
@@ -285,16 +285,16 @@ test('list + clean: inventory marks _N copies, cleanup modes work', async (t) =>
 
 test('clean rejects unknown modes', async (t) => {
   const { h } = withDropbox(t)
-  const r = await h.call('/api/drop-file-to-path/clean', { mode: 'everything' })
+  const r = await h.call('/api/file-upload/clean', { mode: 'everything' })
   assert.equal(r.code, 400)
   assert.match(r.body.error, /清理模式/)
 })
 
 test('abort discards the session', async (t) => {
   const { h } = withDropbox(t)
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'a.txt', size: 10 })
-  await h.call('/api/drop-file-to-path/abort', { token: begin.body.token })
-  const end = await h.call('/api/drop-file-to-path/end', { token: begin.body.token })
+  const begin = await h.call('/api/file-upload/begin', { name: 'a.txt', size: 10 })
+  await h.call('/api/file-upload/abort', { token: begin.body.token })
+  const end = await h.call('/api/file-upload/end', { token: begin.body.token })
   assert.equal(end.code, 400)
   assert.match(end.body.error, /不存在或已过期/)
 })
@@ -302,14 +302,14 @@ test('abort discards the session', async (t) => {
 test('oversized request body is rejected', async (t) => {
   const { h } = withDropbox(t)
   const huge = { name: 'x'.repeat(17 * 1024 * 1024), size: 1 }
-  const r = await h.call('/api/drop-file-to-path/begin', huge)
+  const r = await h.call('/api/file-upload/begin', huge)
   assert.equal(r.code, 400)
   assert.match(r.body.error, /上限/)
 })
 
 test('session expires after the timeout', async (t) => {
   const { h } = withDropbox(t)
-  const begin = await h.call('/api/drop-file-to-path/begin', { name: 'a.txt', size: 10 })
-  const end = await h.call('/api/drop-file-to-path/end', { token: begin.body.token })
+  const begin = await h.call('/api/file-upload/begin', { name: 'a.txt', size: 10 })
+  const end = await h.call('/api/file-upload/end', { token: begin.body.token })
   assert.equal(end.code, 400)
 })
