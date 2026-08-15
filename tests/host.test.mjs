@@ -1,16 +1,21 @@
 // Host-half behavior tests for dsh-file-upload. Runs standalone with
 // `node --test tests/host.test.mjs` (no DSH server required): the plugin's
 // apply() is driven with a fake webServer/timer ctx and a temp dropbox dir.
+// v2.1.0: + P1 lastModified-aware fast-path regression, + P2 manifest-based
+// duplicate marking, + P7 pure-illegal-name sanitize, + P8 Origin guard.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, sanitize, storedB64Length } from '../lib/index.js'
 
 // Must mirror lib/index.js CHUNK_BYTES (multiple of 3, padding-free chunks).
 const CHUNK = 4 * 1024 * 1024 - 1
+// A stable File.lastModified the tests pretend the browser reported.
+const FIXED_TS = 1700000000000
+const MANIFEST = '.dsh-manifest.json'
 
 function makeHarness(config) {
   const routes = []
@@ -24,11 +29,12 @@ function makeHarness(config) {
   }
   apply(ctx, config)
   const byPath = (p) => routes.find((r) => r.path === p)
-  async function call(path, body, remoteAddress = '127.0.0.1') {
+  async function call(path, body, remoteAddress = '127.0.0.1', headers = {}) {
     const route = byPath(path)
     assert.ok(route, 'route ' + path)
     const req = new EventEmitter()
     req.socket = { remoteAddress }
+    req.headers = headers
     const res = { code: 0, body: '', writeHead(c) { this.code = c }, end(b) { this.body = b } }
     const promise = route.handler(req, res)
     const payload = Buffer.from(JSON.stringify(body))
@@ -51,8 +57,13 @@ function chunksOf(buf) {
   return parts
 }
 
-async function upload(h, name, buf) {
-  const begin = await h.call('/api/file-upload/begin', { name, size: buf.length })
+/** Dropbox contents excluding the plugin manifest (internal bookkeeping). */
+function diskFiles(dir) {
+  return readdirSync(dir).filter((n) => n !== MANIFEST)
+}
+
+async function upload(h, name, buf, lastModified = FIXED_TS) {
+  const begin = await h.call('/api/file-upload/begin', { name, size: buf.length, lastModified })
   assert.equal(begin.code, 200, 'begin ok')
   // begin fast-path: same name+size already in the dropbox → path returned,
   // no token, nothing uploaded.
@@ -77,7 +88,7 @@ function withDropbox(t, config) {
   return { dir, h: makeHarness(config) }
 }
 
-test('sanitize: illegal chars, reserved device names, trailing dots, length cap', () => {
+test('sanitize: illegal chars, reserved device names, trailing dots, length cap, pure-illegal fallback', () => {
   assert.equal(sanitize('a/b:c*?.txt'), 'a_b_c__.txt')
   assert.equal(sanitize('CON'), '_CON')
   assert.equal(sanitize('con.txt'), '_con.txt')
@@ -88,6 +99,10 @@ test('sanitize: illegal chars, reserved device names, trailing dots, length cap'
   assert.equal(sanitize('name  '), 'name')
   assert.equal(sanitize(''), 'file')
   assert.equal(sanitize(undefined), 'file')
+  // P7: a name that sanitizes to nothing but replacement underscores.
+  assert.equal(sanitize('::::'), 'file')
+  assert.equal(sanitize('***'), 'file')
+  assert.equal(sanitize('???'), 'file')
   const long = 'x'.repeat(200) + '.txt'
   assert.ok(sanitize(long).length <= 120)
   assert.ok(sanitize(long).endsWith('.txt'))
@@ -192,7 +207,7 @@ test('dedupe: identical content reuses the existing path, no duplicate file (via
   const second = await upload(h, 'dup.txt', content)
   assert.equal(second.code, 200)
   assert.equal(second.body.path, first.body.path, 'identical upload must reuse the same path')
-  assert.deepEqual(readdirSync(dir), ['dup.txt'])
+  assert.deepEqual(diskFiles(dir), ['dup.txt'])
 })
 
 test('dedupe: same name but DIFFERENT size must NOT reuse (new _1 copy)', async (t) => {
@@ -214,7 +229,7 @@ test('dedupe: identical binary content reuses the .b64 path (via begin fast-path
   const first = await upload(h, 'img.png', content)
   const second = await upload(h, 'img.png', content)
   assert.equal(second.body.path, first.body.path)
-  assert.deepEqual(readdirSync(dir), ['img.png.b64'])
+  assert.deepEqual(diskFiles(dir), ['img.png.b64'])
 })
 
 test('non-loopback callers are accepted (no remote-address gate; the server binds loopback anyway)', async (t) => {
@@ -223,16 +238,16 @@ test('non-loopback callers are accepted (no remote-address gate; the server bind
   assert.equal(ok.code, 200)
 })
 
-test('begin fast-path: same name+size reuses instantly without any upload', async (t) => {
+test('begin fast-path: same name+size+lastModified reuses instantly without any upload', async (t) => {
   const { dir, h } = withDropbox(t)
   const content = Buffer.from('fast dedupe', 'utf8')
   const first = await upload(h, 'fast.txt', content)
   assert.equal(first.code, 200)
-  const begin = await h.call('/api/file-upload/begin', { name: 'fast.txt', size: content.length })
+  const begin = await h.call('/api/file-upload/begin', { name: 'fast.txt', size: content.length, lastModified: FIXED_TS })
   assert.equal(begin.code, 200)
   assert.equal(begin.body.path, first.body.path)
   assert.equal(begin.body.encoded, false)
-  assert.deepEqual(readdirSync(dir), ['fast.txt'], 'no new copy on disk')
+  assert.deepEqual(diskFiles(dir), ['fast.txt'], 'no new copy on disk')
 })
 
 test('begin fast-path hits .b64 files too', async (t) => {
@@ -240,13 +255,113 @@ test('begin fast-path hits .b64 files too', async (t) => {
   const content = Buffer.from([1, 2, 3, 4, 5])
   const first = await upload(h, 'f.bin', content)
   assert.equal(first.code, 200)
-  const begin = await h.call('/api/file-upload/begin', { name: 'f.bin', size: content.length })
+  const begin = await h.call('/api/file-upload/begin', { name: 'f.bin', size: content.length, lastModified: FIXED_TS })
   assert.equal(begin.body.path, first.body.path)
   assert.equal(begin.body.encoded, true)
-  assert.deepEqual(readdirSync(dir), ['f.bin.b64'])
+  assert.deepEqual(diskFiles(dir), ['f.bin.b64'])
 })
 
-test('list + clean: inventory marks _N copies, cleanup modes work', async (t) => {
+// ---- v2.1.0 P1 regression: the fast path must never reuse an edited file ----
+test('P1: same name+size but DIFFERENT lastModified (edited file) must NOT reuse; content lands as _1', async (t) => {
+  const { dir, h } = withDropbox(t)
+  const a = Buffer.from('P1-AAAA-BBBB-CCCC-DDDD')
+  const b = Buffer.from('P1-BBBB-CCCC-DDDD-EEEE') // same 20 bytes, different content
+  const first = await upload(h, 'p1.txt', a, 1700000000000)
+  assert.equal(first.body.path, join(dir, 'p1.txt'))
+  // Same size, different content, file was edited (new lastModified, well
+  // beyond the 1s tolerance):
+  // begin must fall through to a full upload instead of returning the old path.
+  const begin = await h.call('/api/file-upload/begin', { name: 'p1.txt', size: b.length, lastModified: 1700000002000 })
+  assert.equal(begin.code, 200)
+  assert.ok(begin.body.token, 'must issue a token (no silent reuse)')
+  await h.call('/api/file-upload/chunk', { token: begin.body.token, index: 0, data: b64(b) })
+  const end = await h.call('/api/file-upload/end', { token: begin.body.token })
+  assert.equal(end.code, 200)
+  assert.ok(end.body.path.endsWith('p1_1.txt'), 'edited content must land as _1 copy')
+  assert.equal(readFileSync(join(dir, 'p1.txt'), 'utf8'), a.toString())
+  assert.equal(readFileSync(join(dir, 'p1_1.txt'), 'utf8'), b.toString())
+})
+
+test('P1: same content but different lastModified reuses by hash at end (no _1)', async (t) => {
+  const { dir, h } = withDropbox(t)
+  const content = Buffer.from('identical bytes, re-saved file', 'utf8')
+  await upload(h, 'p1b.txt', content, 1700000000000)
+  const second = await upload(h, 'p1b.txt', content, 1700000002000) // re-saved, same bytes
+  assert.equal(second.code, 200)
+  assert.equal(second.body.path, join(dir, 'p1b.txt'), 'end hash-dedupe must reuse')
+  assert.deepEqual(diskFiles(dir), ['p1b.txt'])
+})
+
+test('P1: fast path refuses when the manifest has no entry for the file', async (t) => {
+  const { dir, h } = withDropbox(t)
+  // Pre-2.1 dropbox file: on disk, but never registered in the manifest.
+  writeFileSync(join(dir, 'legacy.txt'), 'old dropbox file')
+  const begin = await h.call('/api/file-upload/begin', { name: 'legacy.txt', size: 16, lastModified: FIXED_TS })
+  assert.equal(begin.code, 200)
+  assert.ok(begin.body.token, 'no manifest entry → conservative full upload')
+  await h.call('/api/file-upload/chunk', { token: begin.body.token, index: 0, data: b64(Buffer.from('old dropbox file')) })
+  const end = await h.call('/api/file-upload/end', { token: begin.body.token })
+  assert.equal(end.code, 200)
+  assert.equal(end.body.path, join(dir, 'legacy.txt'), 'end hash-dedupe reuses + registers the entry')
+  // Now the file is registered: fast path works again.
+  const begin2 = await h.call('/api/file-upload/begin', { name: 'legacy.txt', size: 16, lastModified: FIXED_TS })
+  assert.equal(begin2.body.path, join(dir, 'legacy.txt'))
+})
+
+// ---- v2.1.0 P2 regression: duplicate marking comes from the manifest ----
+test('P2: natural `_N` names are NOT duplicates; only manifest-registered plugin copies are', async (t) => {
+  const { dir, h } = withDropbox(t)
+  // Natural files the user placed (or another tool wrote) — never in the manifest.
+  writeFileSync(join(dir, 'notes.txt'), 'n1')
+  writeFileSync(join(dir, 'notes_2024.txt'), 'n2')
+  writeFileSync(join(dir, 'notes_2025.txt'), 'n3')
+  // Plugin-created copy via the real pipeline.
+  await upload(h, 'a.txt', Buffer.alloc(100, 1))
+  await upload(h, 'a.txt', Buffer.alloc(101, 2)) // → a_1.txt, manifest isCopy=true
+
+  const list = await h.call('/api/file-upload/list', {})
+  assert.equal(list.code, 200)
+  const mark = Object.fromEntries(list.body.files.map((f) => [f.name, f.duplicate]))
+  assert.equal(mark['notes.txt'], false)
+  assert.equal(mark['notes_2024.txt'], false, 'natural dated name must not be flagged')
+  assert.equal(mark['notes_2025.txt'], false, 'natural dated name must not be flagged')
+  assert.equal(mark['a.txt'], false)
+  assert.equal(mark['a_1.txt'], true, 'manifest-registered plugin copy must be flagged')
+
+  // Cleaning duplicates must only remove the plugin copy.
+  const dup = await h.call('/api/file-upload/clean', { mode: 'duplicates' })
+  assert.deepEqual(dup.body.deleted, ['a_1.txt'])
+  assert.deepEqual(diskFiles(dir).sort(), ['a.txt', 'notes.txt', 'notes_2024.txt', 'notes_2025.txt'])
+})
+
+// ---- v2.1.0 P8: cross-origin guard ----
+test('P8: cross-origin requests are rejected; same-origin and tokenless callers pass', async (t) => {
+  const { h } = withDropbox(t)
+  const evil = await h.call('/api/file-upload/begin', { name: 'a.txt', size: 4 }, '127.0.0.1', { origin: 'http://evil.example.com', host: '127.0.0.1:3080' })
+  assert.equal(evil.code, 403)
+  assert.match(evil.body.error, /跨源/)
+  const same = await h.call('/api/file-upload/begin', { name: 'a.txt', size: 4 }, '127.0.0.1', { origin: 'http://127.0.0.1:3080', host: '127.0.0.1:3080' })
+  assert.equal(same.code, 200)
+  const localhost = await h.call('/api/file-upload/begin', { name: 'a.txt', size: 4 }, '127.0.0.1', { origin: 'http://localhost:3080', host: 'localhost:3080' })
+  assert.equal(localhost.code, 200)
+  const noOrigin = await h.call('/api/file-upload/begin', { name: 'a.txt', size: 4 })
+  assert.equal(noOrigin.code, 200)
+})
+
+// ---- v2.1.0 P3: a failed upload must not leave the host job alive ----
+test('P3: client-style failure path — abort releases the job immediately', async (t) => {
+  const { h } = withDropbox(t)
+  const begin = await h.call('/api/file-upload/begin', { name: 'x.bin', size: 100 })
+  const token = begin.body.token
+  // Simulate the v2.1.0 client: chunk fails (bad data) → client calls abort.
+  await h.call('/api/file-upload/chunk', { token, index: 0, data: 'WRONG' })
+  await h.call('/api/file-upload/abort', { token })
+  const probe = await h.call('/api/file-upload/chunk', { token, index: 0, data: 'WRONG' })
+  assert.equal(probe.code, 400)
+  assert.match(probe.body.error, /不存在或已过期/, 'job must be gone right after abort')
+})
+
+test('list + clean: inventory marks manifest _N copies, cleanup modes work', async (t) => {
   const { dir, h } = withDropbox(t)
   // a.txt (100B) and a_1.txt (101B, duplicate), b.bin.b64 and b.bin_1.b64 (duplicate)
   await upload(h, 'a.txt', Buffer.alloc(100, 1))
@@ -269,12 +384,12 @@ test('list + clean: inventory marks _N copies, cleanup modes work', async (t) =>
   const dup = await h.call('/api/file-upload/clean', { mode: 'duplicates' })
   assert.equal(dup.code, 200)
   assert.deepEqual(dup.body.deleted.sort(), ['a_1.txt', 'b.bin_1.b64'])
-  assert.deepEqual(readdirSync(dir).sort(), ['a.txt', 'b.bin.b64'])
+  assert.deepEqual(diskFiles(dir).sort(), ['a.txt', 'b.bin.b64'])
 
   // largerThan mode with a tiny threshold removes everything left
   const big = await h.call('/api/file-upload/clean', { mode: 'largerThan', minSizeBytes: 1 })
   assert.equal(big.code, 200)
-  assert.deepEqual(readdirSync(dir), [])
+  assert.deepEqual(diskFiles(dir), [])
 
   // all mode on an empty dropbox is a no-op
   const all = await h.call('/api/file-upload/clean', { mode: 'all' })
